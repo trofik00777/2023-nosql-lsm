@@ -15,9 +15,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.Comparator;
-import java.util.Iterator;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.logging.Level;
@@ -97,8 +95,17 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
         memTable.put(entry.key(), entry);
     }
 
+    private long getNewFilenameIndex() throws IOException {
+        return Files.walk(config.basePath())
+                .filter(Files::isRegularFile)
+                .map(path -> {
+                    String name = path.getFileName().toString();
+                    return Long.parseLong(name.substring(FILENAME.length() + 1, name.length() - 5));
+                }).max(Comparator.naturalOrder()).orElse(-1L) + 1L;
+    }
+
     @Override
-    public void close() throws IOException {
+    public void flush() throws IOException {
         if (config == null || ssTable == null || !ssTable.arena.scope().isAlive()) {
             return;
         }
@@ -110,10 +117,13 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
         }
 
         try (Arena writeArena = Arena.ofConfined()) {
-            try (FileChannel fileChannelData = FileChannel.open(config.basePath().resolve(FILENAME + ".data"),
+            String filenameCurrent = String.format("%s_%d", FILENAME, getNewFilenameIndex());
+            try (FileChannel fileChannelData = FileChannel.open(
+                    config.basePath().resolve(filenameCurrent + ".data"),
                     StandardOpenOption.WRITE, StandardOpenOption.READ, StandardOpenOption.TRUNCATE_EXISTING,
                     StandardOpenOption.CREATE);
-                 FileChannel fileChannelMeta = FileChannel.open(config.basePath().resolve(FILENAME + ".meta"),
+                 FileChannel fileChannelMeta = FileChannel.open(
+                         config.basePath().resolve(filenameCurrent + ".meta"),
                          StandardOpenOption.WRITE, StandardOpenOption.READ, StandardOpenOption.TRUNCATE_EXISTING,
                          StandardOpenOption.CREATE)) {
                 MemorySegment pageData = fileChannelData.map(FileChannel.MapMode.READ_WRITE, 0, size, writeArena);
@@ -148,6 +158,35 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
                     offsetData += val.key().byteSize();
                     MemorySegment.copy(val.value(), 0, pageData, offsetData, val2Size);
                     offsetData += val.value().byteSize();
+                }
+            }
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        flush();
+    }
+
+    private class SsTablesList {
+        private List<SsTable> ssTables;
+
+        SsTablesList() {
+            boolean created = false;
+            try {
+                ssTables = new ArrayList<>();
+                for (long i = 0; i < getNewFilenameIndex(); ++i) {
+                    var ssTable = new SsTable(config.basePath(), String.format("%s_%d", FILENAME, i));
+
+                    ssTables.add();
+                }
+
+                created = true;
+            } catch (Exception e) {
+                created = false;
+            } finally {
+                if (!created) {
+                    ssTables = null;
                 }
             }
         }
