@@ -26,7 +26,7 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
 
     private final ConcurrentNavigableMap<MemorySegment, Entry<MemorySegment>> memTable;
     private final Config config;
-    private final SsTable ssTable;
+    private final SsTablesList ssTables;
 
     private static final Comparator<MemorySegment> COMPARE_SEGMENT = (o1, o2) -> {
         if (o1 == null || o2 == null) {
@@ -49,32 +49,47 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
     public InMemoryDao() {
         memTable = new ConcurrentSkipListMap<>(COMPARE_SEGMENT);
         config = null;
-        ssTable = null;
+        ssTables = null;
     }
 
     public InMemoryDao(Config config) {
+//        this.config = config;
+//        memTable = new ConcurrentSkipListMap<>(COMPARE_SEGMENT);
+//        SsTable sstable = new SsTable(config.basePath(), FILENAME);
+//        if (sstable.data == null || sstable.offsetsTable == null) {
+//            ssTable = null;
+//        } else {
+//            ssTable = sstable;
+//        }
+
+
         this.config = config;
         memTable = new ConcurrentSkipListMap<>(COMPARE_SEGMENT);
-        SsTable sstable = new SsTable(config.basePath(), FILENAME);
-        if (sstable.data == null || sstable.offsetsTable == null) {
-            ssTable = null;
+
+        SsTablesList sstables = new SsTablesList();
+        if (sstables.ssTables == null) {
+            ssTables = null;
         } else {
-            ssTable = sstable;
+            ssTables = sstables;
         }
     }
 
     @Override
     public Iterator<Entry<MemorySegment>> get(MemorySegment from, MemorySegment to) {
+        return new DaoIter(ssTables, from, to);
+    }
+
+    public ConcurrentNavigableMap<MemorySegment, Entry<MemorySegment>> memTableFromTo(MemorySegment from, MemorySegment to) {
         if (from == null || to == null) {
             if (from == null && to == null) {
-                return memTable.values().iterator();
+                return memTable;
             } else if (from == null) {
-                return memTable.headMap(to).values().iterator();
+                return memTable.headMap(to);
             } else {
-                return memTable.tailMap(from).values().iterator();
+                return memTable.tailMap(from);
             }
         } else {
-            return memTable.subMap(from, to).values().iterator();
+            return memTable.subMap(from, to);
         }
     }
 
@@ -84,8 +99,8 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
         if (resultMemTable != null) {
             return resultMemTable;
         }
-        if (ssTable != null) {
-            return ssTable.get(key);
+        if (this.ssTables != null) {
+            return this.ssTables.get(key);
         }
         return null;
     }
@@ -96,20 +111,21 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
     }
 
     private long getNewFilenameIndex() throws IOException {
-        return Files.walk(config.basePath())
-                .filter(Files::isRegularFile)
-                .map(path -> {
-                    String name = path.getFileName().toString();
-                    return Long.parseLong(name.substring(FILENAME.length() + 1, name.length() - 5));
-                }).max(Comparator.naturalOrder()).orElse(-1L) + 1L;
+        try (var walk = Files.walk(config.basePath())) {
+            return walk.filter(Files::isRegularFile)
+                    .map(path -> {
+                        String name = path.getFileName().toString();
+                        return Long.parseLong(name.substring(FILENAME.length() + 1, name.length() - 5));
+                    }).max(Comparator.naturalOrder()).orElse(-1L) + 1L;
+        }
     }
 
     @Override
     public void flush() throws IOException {
-        if (config == null || ssTable == null || !ssTable.arena.scope().isAlive()) {
+        if (config == null || ssTables == null) {
             return;
         }
-        ssTable.arena.close();
+        ssTables.ssTables.forEach(ssTable -> ssTable.arena.close());
 
         long size = 0;
         for (Map.Entry<MemorySegment, Entry<MemorySegment>> entry : memTable.entrySet()) {
@@ -175,13 +191,17 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
             boolean created = false;
             try {
                 ssTables = new ArrayList<>();
+                created = true;
+
                 for (long i = 0; i < getNewFilenameIndex(); ++i) {
                     var ssTable = new SsTable(config.basePath(), String.format("%s_%d", FILENAME, i));
 
-                    ssTables.add();
+                    if (ssTable.data == null || ssTable.offsetsTable == null) {
+                        created = false;
+                        break;
+                    }
+                    ssTables.add(ssTable);
                 }
-
-                created = true;
             } catch (Exception e) {
                 created = false;
             } finally {
@@ -189,6 +209,16 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
                     ssTables = null;
                 }
             }
+        }
+
+        public Entry<MemorySegment> get(MemorySegment key) {
+            for (int i = ssTables.size() - 1; i >= 0; --i) {
+                var result = ssTables.get(i).get(key);
+                if (result != null) {
+                    return result;
+                }
+            }
+            return null;
         }
     }
 
@@ -261,6 +291,42 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
             return null;
         }
 
+        long getLeft(MemorySegment key) {
+            long l = -1;
+            long r = size;
+            while (l < r - 1) {
+                long m = (l + r) / 2;
+                var offset = getOffset(m);
+                MemorySegment dataM = data.asSlice(offset.keyOffset, offset.keySize);
+                int cmp = COMPARE_SEGMENT.compare(dataM, key);
+                if (cmp < 0) {
+                    l = m;
+                } else {
+                    r = m;
+                }
+            }
+
+            return r;
+        }
+
+        long getRight(MemorySegment key) {
+            long l = -1;
+            long r = size;
+            while (l < r - 1) {
+                long m = (l + r) / 2;
+                var offset = getOffset(m);
+                MemorySegment dataM = data.asSlice(offset.keyOffset, offset.keySize);
+                int cmp = COMPARE_SEGMENT.compare(dataM, key);
+                if (cmp <= 0) {
+                    l = m;
+                } else {
+                    r = m;
+                }
+            }
+
+            return r;
+        }
+
         static class Offset implements Serializable {
             private final long keyOffset;
             private final long keySize;
@@ -272,6 +338,143 @@ public class InMemoryDao implements Dao<MemorySegment, Entry<MemorySegment>> {
                 this.keySize = keySize;
                 this.val1Size = val1Size;
                 this.val2Size = val2Size;
+            }
+        }
+    }
+
+    private static class SsTableIter implements Iterator<Entry<MemorySegment>> {
+        SsTable data;
+        long currentIndex = 0;
+        long to;
+
+        SsTableIter(SsTable sstable, MemorySegment from, MemorySegment to) {
+            data = sstable;
+            if (from != null) {
+                currentIndex = data.getLeft(from);
+            }
+            if (to == null) {
+                this.to = data.size - 1;
+            } else {
+                this.to = data.getRight(to);
+            }
+        }
+
+        @Override
+        public boolean hasNext() {
+            return currentIndex <= to;
+        }
+
+        @Override
+        public Entry<MemorySegment> next() {
+            var offset = data.getOffset(currentIndex);
+            currentIndex++;
+            return new BaseEntry<>(
+                    data.data.asSlice(offset.keyOffset + offset.keySize, offset.val1Size),
+                    data.data.asSlice(offset.keyOffset + offset.keySize + offset.val1Size, offset.val2Size)
+            );
+        }
+
+        public MemorySegment nextKey() {
+            var offset = data.getOffset(currentIndex);
+            return data.data.asSlice(offset.keyOffset, offset.keySize);
+        }
+    }
+
+    private class MemTableIter implements Iterator<Entry<MemorySegment>> {
+        private final Iterator<Map.Entry<MemorySegment, Entry<MemorySegment>>> iter;
+        Map.Entry<MemorySegment, Entry<MemorySegment>> current;
+
+        MemTableIter(MemorySegment from, MemorySegment to) {
+            this.iter = memTableFromTo(from, to).entrySet().iterator();
+            if (iter.hasNext()) {
+                this.current = iter.next();
+            }
+        }
+
+        @Override
+        public boolean hasNext() {
+            return current != null;
+        }
+
+        @Override
+        public Entry<MemorySegment> next() {
+            var result = current;
+            if (iter.hasNext()) {
+                this.current = iter.next();
+            } else {
+                this.current = null;
+            }
+            return result.getValue();
+        }
+
+        public MemorySegment nextKey() {
+            return current.getKey();
+        }
+    }
+
+    private class DaoIter implements Iterator<Entry<MemorySegment>> {
+        private MemTableIter memTableIter;
+        private TreeSet<MemSegmentWithIndex> queue;
+        private List<SsTableIter> iters;
+
+        DaoIter(SsTablesList ssTables, MemorySegment from, MemorySegment to) {
+            this.memTableIter = new MemTableIter(from, to);
+            queue = new TreeSet<>();
+
+            if (ssTables != null) {
+                iters = new ArrayList<>();
+                for (SsTable ssTable : ssTables.ssTables) {
+                    iters.add(new SsTableIter(ssTable, from, to));
+                }
+
+                for (int i = 0; i < iters.size(); ++i) {
+                    if (iters.get(i).hasNext()) {
+                        queue.add(new MemSegmentWithIndex(iters.get(i).nextKey(), i));
+                    }
+                }
+            }
+        }
+
+        @Override
+        public boolean hasNext() {
+            return memTableIter.hasNext() || !queue.isEmpty();
+        }
+
+        @Override
+        public Entry<MemorySegment> next() {
+            if (queue.isEmpty()) {
+                return memTableIter.next();
+            }
+            var fromSstable = queue.first();
+            var fromMemTable = memTableIter.nextKey();
+            int cmp = COMPARE_SEGMENT.compare(fromMemTable, fromSstable.data);
+            if (cmp <= 0) {
+                return memTableIter.next();
+            }
+            var result = iters.get(fromSstable.index).next();
+            queue.remove(fromSstable);
+            if (iters.get(fromSstable.index).hasNext()) {
+                queue.add(new MemSegmentWithIndex(iters.get(fromSstable.index).nextKey(), fromSstable.index));
+            }
+            return result;
+        }
+
+        private class MemSegmentWithIndex implements Comparable<MemSegmentWithIndex> {
+            private MemorySegment data;
+            private int index;
+
+            public MemSegmentWithIndex(MemorySegment data, int index) {
+                this.data = data;
+                this.index = index;
+            }
+
+            @Override
+            public int compareTo(MemSegmentWithIndex other) {
+                int cmp = COMPARE_SEGMENT.compare(data, other.data);
+                if (cmp == 0) {
+                    return index < other.index ? -1 : 1;
+                }
+                return cmp;
             }
         }
     }
